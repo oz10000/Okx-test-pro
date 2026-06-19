@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-exchange_engine.py - Motor OKX determinista SIN clOrdId
-OKX es la única fuente de verdad.
+engine/exchange_engine.py - Motor OKX determinista.
+OKX es la única fuente de verdad. Sin clOrdId (evita error 51000).
 """
 
 import ccxt
@@ -16,7 +16,7 @@ from typing import Dict, List, Optional, Any
 logger = logging.getLogger(__name__)
 
 class ExchangeEngine:
-    """Motor OKX para sandbox/real. Sin estado local crítico."""
+    """Motor de intercambio para OKX (sandbox/real)."""
 
     def __init__(self, sandbox: bool = True):
         self.sandbox = sandbox
@@ -33,31 +33,49 @@ class ExchangeEngine:
             self.exchange.set_sandbox_mode(True)
             logger.info("🔬 OKX Sandbox activado.")
         else:
-            logger.warning("🔥 OKX REAL activado. ¡Precaución!")
+            logger.warning("🔥 OKX REAL activado. ¡Extrema precaución!")
 
-        # Para telemetría
+        # Log de auditoría interno
         self.api_log = []
         self.max_log_entries = 1000
+
+    # ======================== AUDITORÍA ========================
+
+    def _log_api(self, endpoint: str, payload: dict, response: dict, latency_ms: float = 0):
+        """Registra todas las interacciones con la API."""
+        entry = {
+            'timestamp': time.time(),
+            'endpoint': endpoint,
+            'payload': payload,
+            'response': response,
+            'latency_ms': round(latency_ms, 2)
+        }
+        self.api_log.append(entry)
+        if len(self.api_log) > self.max_log_entries:
+            self.api_log.pop(0)
+        try:
+            os.makedirs('logs', exist_ok=True)
+            with open('logs/api_calls.jsonl', 'a') as f:
+                f.write(json.dumps(entry) + '\n')
+        except Exception:
+            pass
 
     # ======================== CONEXIÓN ========================
 
     def connect(self) -> bool:
-        """Verifica credenciales."""
+        """Verifica credenciales contra OKX."""
         try:
             self.exchange.fetch_balance()
             logger.info("✅ Conexión OKX establecida.")
             return True
-        except ccxt.AuthenticationError as e:
-            logger.error(f"❌ Error de autenticación: {e}")
-            return False
         except Exception as e:
             logger.error(f"❌ Error de conexión: {e}")
             return False
 
-    # ======================== DATOS ========================
+    # ======================== DATOS PÚBLICOS/PRIVADOS ========================
 
     def fetch_balance(self, currency: str = 'USDT') -> float:
-        """Devuelve saldo disponible."""
+        """Retorna saldo disponible."""
         try:
             bal = self.exchange.fetch_balance()
             return bal.get(currency, {}).get('free', 0.0)
@@ -66,7 +84,7 @@ class ExchangeEngine:
             return 0.0
 
     def fetch_positions(self, symbol: Optional[str] = None) -> List[Dict]:
-        """Devuelve posiciones abiertas."""
+        """Retorna posiciones abiertas."""
         try:
             positions = self.exchange.fetch_positions([symbol] if symbol else None)
             return [p for p in positions if abs(p.get('contracts', 0)) > 0.0001]
@@ -75,71 +93,66 @@ class ExchangeEngine:
             return []
 
     def fetch_ticker(self, symbol: str) -> Dict:
-        """Obtiene ticker actual (precio, volumen)."""
+        """Obtiene ticker actual."""
         try:
             return self.exchange.fetch_ticker(symbol)
         except Exception as e:
             logger.error(f"Error en fetch_ticker: {e}")
             return {'last': 0.0, 'bid': 0.0, 'ask': 0.0}
 
-    # ======================== EJECUCIÓN ========================
+    # ======================== ÓRDENES (SIN CLORDID) ========================
 
     def create_market_order(self, symbol: str, side: str, size: float) -> Dict:
         """
         Abre orden de mercado.
-        - NO usa clOrdId (evita error 51000)
-        - Espera confirmación de llenado (polling)
+        - NO usa clOrdId (evita error 51000).
+        - Polling hasta confirmar 'filled'.
         """
         params = {
             'tdMode': 'isolated',
             'posSide': 'long' if side == 'buy' else 'short'
         }
-        # clOrdId ELIMINADO - OKX asigna ordId automáticamente
 
+        start = time.time()
         try:
-            # 1. Enviar orden
             order = self.exchange.create_order(symbol, 'market', side, size, None, params)
+            latency = (time.time() - start) * 1000
             ord_id = order.get('id') or order.get('ordId')
+            self._log_api('create_order', params, order, latency)
+
             if not ord_id:
-                self._log_api('create_order', params, {'error': 'No ordId'}, 0)
                 return {'success': False, 'error': 'No se recibió ordId'}
 
-            # 2. Esperar llenado (polling)
-            start = time.time()
+            # Polling de confirmación
+            start_poll = time.time()
             avg_px = 0.0
-            filled = 0.0
-
-            while time.time() - start < 10:
+            while time.time() - start_poll < 10:
                 try:
                     fetch_resp = self.exchange.fetch_order(ord_id, symbol)
                     status = fetch_resp.get('status')
                     avg_px = fetch_resp.get('average') or fetch_resp.get('price') or 0.0
-                    filled = fetch_resp.get('filled', 0.0) or 0.0
-
                     if status in ('closed', 'filled'):
-                        self._log_api('fetch_order', {'ordId': ord_id}, fetch_resp, 0)
                         return {
                             'success': True,
                             'ordId': ord_id,
                             'avgPx': avg_px,
-                            'filled': filled,
-                            'status': status
+                            'filled': fetch_resp.get('filled', 0.0)
                         }
                     elif status in ('cancelled', 'rejected'):
                         return {'success': False, 'error': f'Orden {status}'}
-                except Exception as e:
-                    logger.debug(f"Polling fetch_order falló: {e}")
+                except Exception:
+                    pass
                 time.sleep(0.5)
 
             return {'success': False, 'error': 'Timeout esperando llenado'}
 
         except Exception as e:
             logger.error(f"Error en create_market_order: {e}")
-            self._log_api('create_order', params, {'exception': str(e)}, 0)
+            self._log_api('create_order_error', params, {'exception': str(e)}, 0)
             return {'success': False, 'error': str(e)}
 
     def close_position(self, symbol: str, size: Optional[float] = None) -> bool:
-        """Cierra posición (total o parcial)."""
+        """Cierra posición total o parcial."""
         positions = self.fetch_positions(symbol)
         if not positions:
             logger.info(f"No hay posición en {symbol}")
@@ -149,25 +162,27 @@ class ExchangeEngine:
         side = 'sell' if pos['contracts'] > 0 else 'buy'
         size_to_close = abs(pos['contracts']) if size is None else min(abs(pos['contracts']), size)
 
-        params = {
-            'tdMode': 'isolated',
-            'reduceOnly': True
-        }
-        # Sin clOrdId
-
+        params = {'tdMode': 'isolated', 'reduceOnly': True}
         try:
+            start = time.time()
             order = self.exchange.create_order(symbol, 'market', side, size_to_close, None, params)
+            latency = (time.time() - start) * 1000
+            self._log_api('close_order', params, order, latency)
+
             if order.get('id') or order.get('ordId'):
-                logger.info(f"Orden de cierre enviada para {symbol}, size={size_to_close}")
+                logger.info(f"Orden de cierre enviada: {size_to_close} contratos")
                 return True
             return False
         except Exception as e:
             logger.error(f"Error cerrando posición: {e}")
             return False
 
+    # ======================== TP / SL (UNIFICADO) ========================
+
     def set_tp_sl(self, symbol: str, tp_price: float, sl_price: float) -> bool:
         """
-        Coloca Take Profit y Stop Loss (órdenes condicionales reduceOnly).
+        Coloca Take Profit y Stop Loss (reduceOnly, conditional).
+        Unifica la creación de ambas órdenes.
         """
         positions = self.fetch_positions(symbol)
         if not positions:
@@ -184,31 +199,36 @@ class ExchangeEngine:
             'reduceOnly': True,
             'ordType': 'conditional'
         }
-        # Sin clOrdId
 
         success = True
 
         # Take Profit
         try:
             tp_params = {**params_base, 'tpTriggerPx': str(tp_price), 'tpOrdPx': str(tp_price)}
+            start = time.time()
             resp = self.exchange.create_order(symbol, 'market', close_side, size, None, tp_params)
-            self._log_api('place_tp', tp_params, resp, 0)
-            logger.info(f"TP colocado en {tp_price}")
+            latency = (time.time() - start) * 1000
+            self._log_api('set_tp', tp_params, resp, latency)
+            logger.info(f"✅ TP colocado en {tp_price}")
         except Exception as e:
-            logger.error(f"Error colocando TP: {e}")
+            logger.error(f"❌ Error colocando TP: {e}")
             success = False
 
         # Stop Loss
         try:
             sl_params = {**params_base, 'slTriggerPx': str(sl_price), 'slOrdPx': str(sl_price)}
+            start = time.time()
             resp = self.exchange.create_order(symbol, 'market', close_side, size, None, sl_params)
-            self._log_api('place_sl', sl_params, resp, 0)
-            logger.info(f"SL colocado en {sl_price}")
+            latency = (time.time() - start) * 1000
+            self._log_api('set_sl', sl_params, resp, latency)
+            logger.info(f"✅ SL colocado en {sl_price}")
         except Exception as e:
-            logger.error(f"Error colocando SL: {e}")
+            logger.error(f"❌ Error colocando SL: {e}")
             success = False
 
         return success
+
+    # ======================== CANCELACIONES ========================
 
     def cancel_all_orders(self, symbol: str) -> bool:
         """Cancela órdenes normales y algorítmicas."""
@@ -216,28 +236,34 @@ class ExchangeEngine:
             self.exchange.cancel_all_orders(symbol)
             logger.info(f"Órdenes normales canceladas para {symbol}")
         except Exception as e:
-            logger.warning(f"Error cancelando órdenes normales: {e}")
+            logger.warning(f"Error cancelando normales: {e}")
 
         try:
+            start = time.time()
             resp = self.exchange.request('/api/v5/trade/order-algos-pending', 'GET', {'instId': symbol})
+            latency = (time.time() - start) * 1000
+            self._log_api('fetch_algos', {'symbol': symbol}, resp, latency)
+
             if resp.get('code') == '0':
-                algos = resp.get('data', [])
-                for algo in algos:
-                    cancel = self.exchange.request('/api/v5/trade/cancel-algos', 'POST', {
+                for algo in resp.get('data', []):
+                    cancel_start = time.time()
+                    cancel_resp = self.exchange.request('/api/v5/trade/cancel-algos', 'POST', {
                         'instId': symbol,
                         'algoId': algo['algoId']
                     })
-                    logger.info(f"Algo {algo['algoId']} cancelado: {cancel.get('code') == '0'}")
+                    cancel_latency = (time.time() - cancel_start) * 1000
+                    self._log_api('cancel_algo', {'algoId': algo['algoId']}, cancel_resp, cancel_latency)
+                    if cancel_resp.get('code') == '0':
+                        logger.info(f"Algo {algo['algoId']} cancelado.")
         except Exception as e:
             logger.error(f"Error cancelando algos: {e}")
             return False
-
         return True
 
     # ======================== RECONCILIACIÓN ========================
 
     def reconcile_state(self, symbol: str) -> Dict:
-        """Reconcilia el estado real en OKX con el sistema."""
+        """Reconstruye el estado real desde OKX."""
         positions = self.fetch_positions(symbol)
         algos = []
         try:
@@ -247,43 +273,11 @@ class ExchangeEngine:
         except Exception:
             pass
 
-        has_tp = any(a.get('tpTriggerPx') for a in algos)
-        has_sl = any(a.get('slTriggerPx') for a in algos)
-
         return {
             'symbol': symbol,
             'has_position': len(positions) > 0,
             'position': positions[0] if positions else None,
-            'tp_exists': has_tp,
-            'sl_exists': has_sl,
+            'tp_exists': any(a.get('tpTriggerPx') for a in algos),
+            'sl_exists': any(a.get('slTriggerPx') for a in algos),
             'algo_count': len(algos)
         }
-
-    # ======================== TELEMETRÍA ========================
-
-    def _log_api(self, endpoint: str, payload: dict, response: dict, latency_ms: float):
-        """Registra llamadas API internamente."""
-        entry = {
-            'timestamp': time.time(),
-            'endpoint': endpoint,
-            'payload': payload,
-            'response': response,
-            'latency_ms': latency_ms
-        }
-        self.api_log.append(entry)
-        if len(self.api_log) > self.max_log_entries:
-            self.api_log.pop(0)
-        # Guardar en archivo
-        try:
-            with open('logs/api_calls.jsonl', 'a') as f:
-                f.write(json.dumps(entry) + '\n')
-        except Exception:
-            pass
-
-    def get_api_log(self) -> List[Dict]:
-        """Devuelve el log de API."""
-        return self.api_log
-
-    def get_audit_trail(self) -> List[Dict]:
-        """Alias para compatibilidad."""
-        return self.api_log
