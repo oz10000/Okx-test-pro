@@ -2,89 +2,64 @@ name: OKX Sandbox CI
 
 on:
   push:
+    branches: [ main, master ]
   pull_request:
+    branches: [ main, master ]
   workflow_dispatch:
     inputs:
       cycles:
-        description: "Número de ciclos del bot"
+        description: 'Número de ciclos de trading a ejecutar'
         required: false
-        default: "2"
+        default: '2'
+        type: number
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    environment: sandbox
+    timeout-minutes: 10
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    - name: Checkout código
+      uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
+    - name: Configurar Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+        cache: 'pip'
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+    - name: Instalar dependencias
+      run: |
+        pip install --upgrade pip
+        pip install -r requirements.txt
 
-      - name: Run unit tests
-        env:
-          OKX_API_KEY: ${{ secrets.OKX_API_KEY }}
-          OKX_SECRET_KEY: ${{ secrets.OKX_SECRET_KEY }}
-          OKX_PASSPHRASE: ${{ secrets.OKX_PASSPHRASE }}
-          OKX_DEMO: "True"
-        run: |
-          python -m pytest tests/ -v --tb=short
+    - name: Crear directorio de logs
+      run: mkdir -p logs
 
-      - name: Upload test logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: pytest-logs
-          path: |
-            .pytest_cache
-            logs/
-          retention-days: 7
+    - name: Ejecutar pruebas
+      env:
+        OKX_API_KEY: ${{ secrets.OKX_API_KEY }}
+        OKX_SECRET_KEY: ${{ secrets.OKX_SECRET_KEY }}
+        OKX_PASSPHRASE: ${{ secrets.OKX_PASSPHRASE }}
+        CI: true
+      run: |
+        python -m pytest tests/ -v --tb=short
 
-  bot-run:
-    runs-on: ubuntu-latest
-    environment: sandbox
-    needs: test
-    if: github.event_name == 'workflow_dispatch'
+    - name: Ejecutar bot en sandbox (CI mode)
+      if: always()
+      env:
+        OKX_API_KEY: ${{ secrets.OKX_API_KEY }}
+        OKX_SECRET_KEY: ${{ secrets.OKX_SECRET_KEY }}
+        OKX_PASSPHRASE: ${{ secrets.OKX_PASSPHRASE }}
+        MAX_CYCLES: ${{ github.event.inputs.cycles || 2 }}
+        CI: true
+      run: |
+        python runner/main.py
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Run OKX bot (sandbox cycles)
-        env:
-          OKX_API_KEY: ${{ secrets.OKX_API_KEY }}
-          OKX_SECRET_KEY: ${{ secrets.OKX_SECRET_KEY }}
-          OKX_PASSPHRASE: ${{ secrets.OKX_PASSPHRASE }}
-          OKX_DEMO: "True"
-          CI_MODE: "1"
-          MAX_CYCLES: ${{ github.event.inputs.cycles || '2' }}
-        run: |
-          python main.py
-
-      - name: Upload bot runtime logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: okx-bot-logs
-          path: |
-            logs/
-            audit/
-          retention-days: 7
+    - name: Subir logs como artefacto
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: okx-bot-logs
+        path: logs/
+        retention-days: 7
