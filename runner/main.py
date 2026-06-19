@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-main.py - Punto de entrada del bot.
-Orquesta el engine, la estrategia y la telemetría.
+runner/main.py - Orquestador principal del bot.
+Ejecuta el ciclo de trading, sincroniza estado y llama a la estrategia.
 """
 
 import os
@@ -12,72 +12,64 @@ import time
 import json
 import logging
 from datetime import datetime
-from dotenv import load_dotenv
+from typing import Dict, Any, Optional
 
-# Añadir directorio raíz al path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Asegurar que el directorio raíz esté en el path
+root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if root_dir not in sys.path:
+    sys.path.insert(0, root_dir)
+
+# Crear directorio de logs si no existe
+os.makedirs('logs', exist_ok=True)
 
 from engine.exchange_engine import ExchangeEngine
 from strategy.strategy import generate_signal
 
-load_dotenv()
+logger = logging.getLogger(__name__)
 
-# Configurar logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger('BotRunner')
-
-# ======================== TELEMETRÍA ========================
-
+# ================================
+# TELEMETRY (Logging JSON)
+# ================================
 class Telemetry:
-    """Sistema de logging JSON para CI y auditoría."""
+    """Sistema de logging estructurado en JSON para auditoría y CI."""
 
     @staticmethod
-    def log(event_type: str, data: dict, log_file: str = 'logs/execution.jsonl'):
+    def log(event_type: str, data: Dict[str, Any]):
+        """Registra un evento en stdout y en archivo."""
         entry = {
             'timestamp': time.time(),
             'datetime': datetime.utcnow().isoformat(),
             'event_type': event_type,
             'data': data
         }
-        # Escribir a stdout para CI
+        # Salida a stdout (CI-friendly)
         print(json.dumps(entry))
 
-        # Escribir a archivo
+        # Persistencia en archivo
         try:
-            os.makedirs('logs', exist_ok=True)
-            with open(log_file, 'a') as f:
+            with open('logs/execution.jsonl', 'a') as f:
                 f.write(json.dumps(entry) + '\n')
-        except Exception as e:
-            logger.debug(f"No se pudo escribir log: {e}")
+        except Exception:
+            pass  # Silencioso para no romper el flujo
 
-    @staticmethod
-    def log_state(engine, symbol: str, phase: str):
-        """Log del estado actual del sistema."""
-        positions = engine.fetch_positions(symbol)
-        balance = engine.fetch_balance('USDT')
-        Telemetry.log(f'state_{phase}', {
-            'symbol': symbol,
-            'positions': positions,
-            'balance_usdt': balance,
-            'position_count': len(positions)
-        })
-
-# ======================== BOT RUNNER ========================
-
+# ================================
+# FUNCIÓN PRINCIPAL
+# ================================
 def main():
-    # Credenciales
+    """Punto de entrada del runner."""
+    # Configurar logging básico
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+
+    # Credenciales desde variables de entorno
     api_key = os.getenv('OKX_API_KEY')
     secret_key = os.getenv('OKX_SECRET_KEY')
     passphrase = os.getenv('OKX_PASSPHRASE')
 
     if not all([api_key, secret_key, passphrase]):
-        logger.error("❌ Faltan credenciales. Configura OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE")
+        logger.error("❌ Faltan variables: OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE")
         sys.exit(1)
 
     # Configuración
@@ -85,12 +77,12 @@ def main():
     max_cycles = int(os.getenv('MAX_CYCLES', '0'))  # 0 = infinito
     cycle_interval = int(os.getenv('CYCLE_INTERVAL', '5'))
 
-    # CI mode: limitar ciclos si no se especifica
+    # Modo CI: limitar ciclos si no se especifica
     if os.getenv('CI') == 'true' and max_cycles == 0:
         max_cycles = 2
         logger.info("🔁 Modo CI: limitado a 2 ciclos")
 
-    # Inicializar engine
+    # Inicializar engine (sandbox forzado para pruebas)
     engine = ExchangeEngine(sandbox=True)
     if not engine.connect():
         logger.error("❌ No se pudo conectar a OKX")
@@ -119,7 +111,12 @@ def main():
                 ticker = engine.fetch_ticker(symbol)
                 balance = engine.fetch_balance('USDT')
 
-                Telemetry.log_state(engine, symbol, 'pre_tick')
+                Telemetry.log('state_pre', {
+                    'symbol': symbol,
+                    'positions': positions,
+                    'balance_usdt': balance,
+                    'position_count': len(positions)
+                })
 
                 # 2. Generar señal
                 context = {
@@ -137,37 +134,40 @@ def main():
 
                 if action == 'buy':
                     size = signal.get('size', 1.0)
+                    tp = signal.get('tp')
+                    sl = signal.get('sl')
                     logger.info(f"📈 Ejecutando BUY {size} contratos")
                     result = engine.create_market_order(symbol, 'buy', size)
                     Telemetry.log('order', {'action': 'buy', 'result': result})
-
-                    if result.get('success'):
-                        tp = signal.get('tp')
-                        sl = signal.get('sl')
-                        if tp and sl:
-                            logger.info(f"🔒 Colocando TP={tp}, SL={sl}")
-                            engine.set_tp_sl(symbol, tp, sl)
+                    if result.get('success') and tp and sl:
+                        engine.set_tp_sl(symbol, tp, sl)
+                        Telemetry.log('protection', {'tp': tp, 'sl': sl})
 
                 elif action == 'sell':
                     size = signal.get('size', 1.0)
+                    tp = signal.get('tp')
+                    sl = signal.get('sl')
                     logger.info(f"📉 Ejecutando SELL {size} contratos")
                     result = engine.create_market_order(symbol, 'sell', size)
                     Telemetry.log('order', {'action': 'sell', 'result': result})
-
-                elif action == 'hold':
-                    logger.info("⏸️ Manteniendo posición actual")
+                    if result.get('success') and tp and sl:
+                        engine.set_tp_sl(symbol, tp, sl)
 
                 elif action == 'close':
                     logger.info("🔚 Cerrando posición")
                     engine.close_position(symbol)
+                    Telemetry.log('close', {'symbol': symbol})
+
+                elif action == 'hold':
+                    logger.info("⏸️ Manteniendo posición")
 
                 else:
                     logger.warning(f"⚠️ Acción desconocida: {action}")
 
-                # 4. Estado post-ejecución
-                Telemetry.log_state(engine, symbol, 'post_tick')
+                # 4. Reconciliar estado post-ejecución
+                post_state = engine.reconcile_state(symbol)
+                Telemetry.log('state_post', post_state)
 
-                # 5. Esperar
                 if max_cycles > 0 and loop >= max_cycles:
                     break
                 time.sleep(cycle_interval)
@@ -177,15 +177,16 @@ def main():
             except Exception as e:
                 logger.error(f"❌ Error en ciclo {loop}: {e}")
                 Telemetry.log('error', {'message': str(e), 'cycle': loop})
+                # Reconciliar tras error para mantener consistencia
+                engine.reconcile_state(symbol)
                 time.sleep(cycle_interval)
 
     except KeyboardInterrupt:
         logger.info("🛑 Interrupción manual")
 
-    # Cierre
     logger.info(f"🏁 Bot finalizado después de {loop} ciclos")
     Telemetry.log('bot_end', {'total_cycles': loop})
     sys.exit(0)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
